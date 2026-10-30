@@ -1,95 +1,115 @@
--- Schema setup
+-- SkyPoints Data Engineering Assessment
+-- NOTE: member_id is used as the operational primary key for routing and joins.
+-- The assessment data dictionary marks Member Name as a key;
+-- but names are not reliable identifiers.
+
 CREATE SCHEMA IF NOT EXISTS skypoints;
-SET search_path TO skypoints, public;
 
--- Drop existing tables to allow fresh rebuilds
-DROP TABLE IF EXISTS table_usa CASCADE;
-DROP TABLE IF EXISTS table_ind CASCADE;
-DROP TABLE IF EXISTS table_aus CASCADE;
-DROP TABLE IF EXISTS fact_redemptions CASCADE;
-DROP TABLE IF EXISTS stg_member_profiles CASCADE;
-DROP TABLE IF EXISTS removed_records CASCADE;
-DROP TABLE IF EXISTS raw_redemptions_json CASCADE;
+DROP TABLE IF EXISTS skypoints.table_phil CASCADE;
+DROP TABLE IF EXISTS skypoints.table_can CASCADE;
+DROP TABLE IF EXISTS skypoints.table_usa CASCADE;
+DROP TABLE IF EXISTS skypoints.table_ind CASCADE;
+DROP TABLE IF EXISTS skypoints.table_aus CASCADE;
+DROP TABLE IF EXISTS skypoints.fact_redemptions CASCADE;
+DROP TABLE IF EXISTS skypoints.raw_redemptions_json CASCADE;
+DROP TABLE IF EXISTS skypoints.removed_records CASCADE;
+DROP TABLE IF EXISTS skypoints.stg_member_profiles CASCADE;
+DROP TABLE IF EXISTS skypoints.raw_member_profiles CASCADE;
 
--- 1. Unified Staging Table (Cleaned data with derived business columns)
-CREATE TABLE stg_member_profiles (
-    staging_id SERIAL PRIMARY KEY,
+-- 1. Raw member landing table: preserve source values before transformation.
+CREATE TABLE skypoints.raw_member_profiles (
+    raw_id BIGSERIAL PRIMARY KEY,
+    source_file VARCHAR(255) NOT NULL,
     source_country VARCHAR(10) NOT NULL,
+    source_row_number BIGINT NOT NULL,
+    raw_record JSONB NOT NULL,
+    ingested_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Staging: raw date strings are retained alongside parsed DATE values.
+CREATE TABLE skypoints.stg_member_profiles (
+    staging_id BIGSERIAL PRIMARY KEY,
+    source_file VARCHAR(255) NOT NULL,
+    source_country VARCHAR(10) NOT NULL,
+    source_row_number BIGINT NOT NULL,
     member_id VARCHAR(50) NOT NULL,
     member_name VARCHAR(255) NOT NULL,
-    dob DATE,
     tier_code VARCHAR(10),
-    enrollment_date DATE,
-    flight_date DATE,
-    individual_or_corporate VARCHAR(20) DEFAULT 'I',
-    age INT,
-    is_stale_member CHAR(1) NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 2. Target Country Tables (One per country, member_name is the business key)
--- Ideally member_id must be the key - when we have millions of records. 
-CREATE TABLE table_usa (
-    member_id VARCHAR(50),
-    member_name VARCHAR(255) PRIMARY KEY,
-    tier_code VARCHAR(10),
-    enrollment_date DATE,
-    flight_date DATE,
+    dob_raw VARCHAR(50),
+    enrollment_date_raw VARCHAR(50),
+    flight_date_raw VARCHAR(50),
     dob DATE,
-    age INT,
-    is_stale_member CHAR(1),
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE table_ind (
-    member_id VARCHAR(50),
-    member_name VARCHAR(255) PRIMARY KEY,
-    tier_code VARCHAR(10),
-    enrollment_date DATE,
+    enrollment_date DATE NOT NULL,
     flight_date DATE,
-    dob DATE,
-    age INT,
+    agent_name VARCHAR(255),
+    state VARCHAR(10),
+    country VARCHAR(10),
+    post_code INTEGER,
+    is_active CHAR(1),
     individual_or_corporate VARCHAR(20),
+    age INTEGER,
     is_stale_member CHAR(1),
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    validation_status VARCHAR(20) NOT NULL DEFAULT 'VALID',
+    ingested_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE table_aus (
-    member_id VARCHAR(50),
-    member_name VARCHAR(255) PRIMARY KEY,
+CREATE INDEX idx_stg_member_id ON skypoints.stg_member_profiles(member_id);
+CREATE INDEX idx_stg_source_country ON skypoints.stg_member_profiles(source_country);
+
+-- 3. Country target tables share an identical structure.
+-- member_id is the primary key so a member is not duplicated within a country.
+CREATE TABLE skypoints.table_usa (
+    member_id VARCHAR(50) PRIMARY KEY,
+    member_name VARCHAR(255) NOT NULL,
     tier_code VARCHAR(10),
-    enrollment_date DATE,
+    enrollment_date DATE NOT NULL,
     flight_date DATE,
     dob DATE,
-    age INT,
+    agent_name VARCHAR(255),
+    state VARCHAR(10),
+    country VARCHAR(10),
+    post_code INTEGER,
+    is_active CHAR(1),
+    individual_or_corporate VARCHAR(20),
+    age INTEGER,
     is_stale_member CHAR(1),
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    source_file VARCHAR(255),
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- 3. Redemptions JSON & Flattened Fact Table
-CREATE TABLE raw_redemptions_json (
-    batch_id SERIAL PRIMARY KEY,
+CREATE TABLE skypoints.table_ind (LIKE skypoints.table_usa INCLUDING ALL);
+CREATE TABLE skypoints.table_aus (LIKE skypoints.table_usa INCLUDING ALL);
+CREATE TABLE skypoints.table_phil (LIKE skypoints.table_usa INCLUDING ALL);
+CREATE TABLE skypoints.table_can (LIKE skypoints.table_usa INCLUDING ALL);
+
+-- 4. Raw JSON landing and flattened redemption fact table.
+CREATE TABLE skypoints.raw_redemptions_json (
+    batch_id BIGSERIAL PRIMARY KEY,
     payload JSONB NOT NULL,
-    received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    received_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE fact_redemptions (
+CREATE TABLE skypoints.fact_redemptions (
     txn_id VARCHAR(50) PRIMARY KEY,
     member_id VARCHAR(50) NOT NULL,
     txn_date DATE NOT NULL,
     partner VARCHAR(100),
-    miles_redeemed INT,
-    status VARCHAR(20),
+    miles_redeemed BIGINT,
+    status VARCHAR(30),
     feed_date DATE,
-    ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ingested_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-CREATE INDEX idx_redemptions_member ON fact_redemptions(member_id);
 
--- 4. Removed Table (For rows with invalid data)
-CREATE TABLE removed_records (
-    quarantine_id SERIAL PRIMARY KEY,
-    source_country VARCHAR(10),
-    raw_record JSONB,
-    rejection_reason TEXT,
-    quarantined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+CREATE INDEX idx_redemptions_member
+    ON skypoints.fact_redemptions(member_id);
+
+-- 5. Rejected records: retain the source location and original values.
+CREATE TABLE skypoints.removed_records (
+    removal_id BIGSERIAL PRIMARY KEY,
+    source_file VARCHAR(255) NOT NULL,
+    source_country VARCHAR(10) NOT NULL,
+    source_row_number BIGINT NOT NULL,
+    raw_record JSONB NOT NULL,
+    rejection_reason TEXT NOT NULL,
+    removed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
