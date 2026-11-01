@@ -1,57 +1,65 @@
+
 # SkyPoints Loyalty ETL
 
-A PostgreSQL/Python reference implementation for the Incubyte Data Engineer assessment. It ingests country member-profile files, validates and stages records, derives Age and Stale Member, routes the latest member record to a country target, and parses a JSON redemption feed into a queryable transaction table.
+Python/PostgreSQL reference implementation for the Incubyte Data Engineer assessment. It ingests member-profile files and a semi-structured redemption JSON feed, validates records, preserves raw inputs, stages accepted profiles, publishes valid profile changes and stores redemption transactions.
 
-## Assessment alignment and explicit assumptions
+## Batch processing
 
-- The assessment data dictionary marks **Member Name** as the key and **Member ID** as non-key. This implementation partitions latest-record selection by normalized Member Name and uses Member Name as the country-target primary key.
-- The assessment says latest record wins but does not define an update timestamp. This implementation uses **Enrollment Date descending** as the primary recency proxy and Last Flight Date descending as a secondary proxy. Enrollment Date is not asserted to be a true profile-update timestamp.
-- Member Name is not a globally reliable real-world identifier: two people can share a name. A production source should provide a stable immutable member surrogate key. That key is not supplied in the assessment.
-- The assessment's example country code is `AU`; the supplied Australia file is identified as `AUS`. Both are explicitly routed to the Australia target. The source value is retained.
-- Post Code appears in the data dictionary but not in the assessment sample layout or the supplied files. It remains nullable.
-- `individual_or_corporate` appears in the supplied India data but not in the assessment dictionary. It is retained as an optional source extension, with no fabricated default.
-- The assessment JSON sample refers to member ID `223457`, which is not in the supplied profile files. The redemption fact table therefore retains the member ID without inventing a profile match.
-- Member ID is not unique in the supplied sample. A join on member ID alone can be ambiguous. A production contract needs a globally unique member key or additional discriminator in the redemption feed.
+Each source file/feed is processed as an independent batch:
 
-## Project layout
+1. Calculate a SHA-256 checksum and derive a batch key from feed type, filename and checksum.
+2. Register the batch in `skypoints.ingestion_batches`.
+3. Mark it `PROCESSING`.
+4. Preserve raw input with its batch ID.
+5. Write accepted profile rows to staging and invalid rows/issues to audit tables.
+6. Publish valid profile changes or redemption transactions.
+7. Mark the batch `SUCCEEDED` in the same transaction as its data publication.
+
+If processing fails, the data transaction rolls back and the batch is marked `FAILED`. Failed batches can be retried. An already successful identical file is skipped. A changed file checksum creates a new batch even when its filename is unchanged.
+
+The source does not currently provide a stable batch ID, so the replay key uses feed type + filename + checksum. If the source system supplies a batch ID in future, use that as the primary replay identifier. A corrected file with different contents is treated as a new delivery.
+
+## Scope and assumptions
+
+- Each available configured feed is processed independently. A run can process one or several profile files and/or the redemption JSON; missing feeds are skipped. At least one feed must be present.
+- This is bounded file/batch processing, not a continuously running streaming application.
+- The existing assessment interpretation is retained: `Member Name` is the target key and `Enrollment Date` is the primary recency proxy. These are assessment assumptions, not ideal real-world identity/update fields.
+- `AU` is routed to the Australia target (`table_aus`); the source country value is retained.
+- `txn_id` is unique in `fact_redemptions`. Identical transaction replays are treated as successfully processed without inserting a second fact; conflicting reuse of a transaction ID is recorded as a rejected issue and is not silently overwritten. Newly inserted facts carry the current `ingestion_batch_id`. Older facts remain unmodified and may have a NULL batch ID because they predate batch tracking.
+- `data/redemptions_sample.json` is an illustrative fixture, not the original production feed.
+
+## Project files
 
 ```text
 main.py
 src/utils.py
 sql/01_ddl_tables.sql
 tests/test_pipeline.py
-data/USA(in).csv
-data/IND(in).csv
-data/AUS.xlsx
-data/redemptions_sample.json
+data/
 requirements.txt
 ```
 
-## Prerequisites
+## Setup
 
-- Python 3.10+
-- PostgreSQL
-- A database named `skypoints_db` (or set `DATABASE_URL`)
-
-Install dependencies:
+Python 3.10+ and PostgreSQL are required.
 
 ```bash
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+# On the local Mac setup used for this assessment, the default connection is:
+# postgresql+psycopg2://<your-mac-user>@localhost:5432/skypoints_db
+# Override only if your PostgreSQL connection requires different settings:
+# export DATABASE_URL='postgresql+psycopg2://USER:PASSWORD@localhost:5432/skypoints_db'
 ```
 
-Create the database schema (the DDL drops and recreates the assessment tables, so use it only when a fresh rebuild is intended):
+Apply the schema:
 
 ```bash
 psql -d skypoints_db -f sql/01_ddl_tables.sql
 ```
 
-Configure the connection if needed:
-
-```bash
-export DATABASE_URL='postgresql+psycopg2://USER:PASSWORD@localhost:5432/skypoints_db'
-```
+The DDL is additive and does not drop or truncate existing tables. Back up an existing database before applying schema changes.
 
 Run tests and pipeline:
 
@@ -60,61 +68,30 @@ python -m pytest -v
 python main.py
 ```
 
-## Input feeds
+Set `DATA_DIR` to change the profile input directory, or `REDEMPTION_FILE` to select another redemption JSON file.
 
-Profile files are configured in `COUNTRY_FILES` in `main.py`. The current reference files are CSV for USA and India and XLSX for Australia. The pipeline checks all configured files before it opens a database transaction. Missing or empty required files fail the run before existing database data is touched.
+## Tables
 
-The redemption feed path defaults to `data/redemptions_sample.json`. Set `REDEMPTION_FILE` to use another JSON file. The loader accepts either one feed object or an array of feed objects. Each feed object has `member_id`, `feed_date`, and a `redemptions` array. Each redemption has `txn_id`, `txn_date`, `partner`, `miles_redeemed`, and `status`.
-
-The sample JSON is a separate input fixture, not hardcoded ETL logic. Replace it with the actual daily feed when available.
-
-## Validation and error handling
-
-- Mandatory Member Name, Member ID and Enrollment Date failures reject the profile row into `removed_records`.
-- Field-length checks follow the assessment dictionary: Name 255, ID 18, Tier 5, Agent 255, State 5, Country 5, Active Member 1.
-- Optional missing fields remain NULL. Invalid optional dates/text/postcodes are nulled and recorded in `data_quality_issues`; they do not reject the entire member.
-- Post Code is validated as up to five digits before conversion to integer. The numeric data type means leading zeroes cannot be preserved; this is inherent in the assessment's INT type.
-- Redemption payload and transaction validations are recorded in `redemption_issues`.
-- An identical replay of a transaction ID is ignored. A repeated transaction ID with different values is recorded as a conflicting duplicate and is not silently overwritten.
-
-## Database tables
-
-- `raw_member_profiles`: original member source records.
-- `stg_member_profiles`: validated and standardized profile records plus derived fields.
-- `table_usa`, `table_ind`, `table_aus`, `table_phil`, `table_can`: country-specific latest profile records.
-- `raw_redemptions_json`: raw JSON feed payloads, deduplicated by payload hash.
-- `fact_redemptions`: flattened transaction-level data.
-- `removed_records`: rejected member records and reasons.
+- `ingestion_batches`: batch identity, checksum, lifecycle status, timestamps and record counts. For redemption batches, counts refer to processed transaction candidates and rejected transaction/feed entries; exact existing transaction replays count as processed.
+- `raw_member_profiles`: original profile rows with batch lineage.
+- `stg_member_profiles`: standardized accepted profile rows with batch lineage.
+- `table_usa`, `table_ind`, `table_aus`, `table_phil`, `table_can`: country-specific published profiles.
+- `raw_redemptions_json`: original JSON objects with batch lineage.
+- `fact_redemptions`: flattened transaction records with batch lineage.
+- `removed_records`: rejected profile rows and reasons.
 - `data_quality_issues`: non-blocking profile warnings.
-- `redemption_issues`: rejected or conflicting redemption feed/transaction issues.
+- `redemption_issues`: rejected/conflicting redemption feed or transaction issues.
 
-## Redemption-to-profile join
+## Operational behaviour and limitations
 
-The assessment JSON contains `member_id`, so the natural illustrative join is `fact_redemptions.member_id = country_target.member_id`. However, Member ID is not declared a key in the assessment and repeats across the supplied country files. The assessment sample's `223457` also has no matching profile in the supplied data. Therefore, the implementation does not claim a guaranteed one-to-one join. A production feed should carry a globally unique immutable member key (or a documented composite key) to make this relationship reliable.
+- Each feed commits independently. A later failure does not roll back earlier successful batches.
+- Normal runs do not truncate historical raw, staging, reject, issue or target data.
+- A batch's `SUCCEEDED` status is committed atomically with its database writes.
+- The implementation reads each profile file into pandas memory and uses PostgreSQL inserts/upserts. It is a small-data assessment implementation, not evidence of very-high-volume throughput.
+- A production-scale design would add durable object storage, bulk loading (for example PostgreSQL `COPY`), partitioning, distributed processing where justified, monitoring, alerting and deployment-level concurrency controls.
+- If a process is forcibly terminated while its batch is `PROCESSING`, inspect that batch and reset it to `FAILED` before retrying. The code deliberately does not assume that an active batch is abandoned.
+- This implementation does not add a distributed scheduler or streaming platform.
 
-## Scalability: production design for very high daily volumes
+## Tests
 
-This repository is a correctness-focused local reference implementation; it is **not** a demonstrated billions-of-records-per-day system. The assessment asks us to consider that scale, but does not prescribe a specific cloud platform or explicitly list implementation techniques. A production design should include:
-
-1. **Durable landing/object storage:** store immutable source files and JSON payloads with batch IDs, checksums, arrival timestamps and replay capability.
-2. **Bulk ingestion:** use database-native bulk loaders (for example PostgreSQL `COPY`, or the target warehouse's bulk load facility) rather than row-by-row inserts.
-3. **Batch/stream processing:** process bounded batches with checkpoints; use distributed processing only when volume and latency justify it.
-4. **Partitioning and indexing:** partition large raw/fact tables by ingestion or transaction date; index/cluster on actual filter and join keys after workload testing.
-5. **Incremental processing:** process only new or changed batches using source batch IDs, watermarks or CDC; avoid truncating all history on every daily run.
-6. **Idempotency:** assign stable batch and transaction identifiers; enforce uniqueness; distinguish identical replays from conflicting duplicates.
-7. **Atomic publication:** load into batch-scoped staging, validate counts and quality thresholds, then publish/swap target partitions only after a successful batch.
-8. **Observability and recovery:** persist batch status, input/output/reject counts, issue rates, duration, retries and lineage; support safe replay of failed batches.
-
-For this assessment prototype, the code uses a single database transaction and bulk-style `executemany`/`to_sql` calls where practical. It still reads profile files into pandas memory and performs a full profile refresh, so it must not be represented as production-scale execution.
-
-## Demo checklist
-
-1. Show the raw, staging, target and redemption table DDL.
-2. Run tests and the pipeline.
-3. Query raw/staging/rejected/warning counts.
-4. Show Age and Stale Member derivations.
-5. Show latest-record routing by Member Name and Enrollment Date.
-6. Show the raw JSON payload and flattened redemption rows.
-7. Demonstrate a missing-file preflight failure and verify that prior target data remains intact.
-8. Demonstrate a malformed optional field warning versus a mandatory-field rejection.
-9. Explain the unresolved Member ID join limitation and the production key requirement.
+Unit tests cover date normalization, derived fields, profile validation, redemption flattening/validation, batch-key determinism, redemption insert parameter binding, exact duplicate handling and batch count consistency. The test suite uses a fake database connection for persistence-path unit tests; it is not a substitute for PostgreSQL integration tests. Run integration tests against a disposable PostgreSQL database before deployment.
