@@ -4,7 +4,8 @@ Python/PostgreSQL reference implementation for the Incubyte Data Engineer assess
 
 ## 1. Scope and assumptions
 
-- Each available configured feed is processed independently. A run can process one or more profile files and/or the redemption JSON feed. Missing feeds are skipped; at least one feed must be present.
+- The pipeline supports one or more profile files and/or a redemption JSON feed in a run. Available profile files are discovered dynamically using the `*_members.csv` naming convention in the `data/` directory.
+- Missing feeds are skipped; at least one feed must be available.
 - This is a bounded batch-processing solution, not a continuously running streaming application.
 - `Member Name`, normalized by trimming whitespace and ignoring case, is used as the assessment-level identity key for country-level publishing.
 - `Member ID` is mandatory and retained as a profile attribute, but is not assumed to be globally unique. The supplied country feeds reuse values such as `1`, `2`, and `3` for different names.
@@ -33,6 +34,8 @@ An already successful identical file is skipped. A changed file checksum creates
 The source does not currently provide a stable batch ID, so the replay key uses feed type, filename, and checksum. If the source system supplies a batch ID in future, it can be incorporated as the primary replay identifier.
 
 Each feed commits independently. A failure in a later batch does not roll back earlier successful batches.
+
+**Important:** Renaming a previously processed input file changes the batch identity because the filename is part of the batch key. Running a renamed file can therefore create a new batch even when its contents have not changed.
 
 ## 3. Member identity and country transfers
 
@@ -69,7 +72,7 @@ A production implementation should use a source update timestamp, version number
 
 The supplied sample redemption member ID (`223457`) does not match the supplied profile IDs. Therefore, a verified join between the sample redemption transactions and member profiles cannot be demonstrated using the provided data.
 
-## 6. Tables
+## 6. Database tables
 
 All tables are under the `skypoints` schema.
 
@@ -89,6 +92,8 @@ All tables are under the `skypoints` schema.
 | `data_quality_issues` | Non-blocking profile warnings, including identity ambiguities |
 | `redemption_issues` | Rejected or conflicting redemption feed and transaction issues |
 
+The country-specific tables also contain `last_batch_received_at` and `last_batch_id` columns to track the most recent batch that published each record.
+
 ## 7. Project structure
 
 ```text
@@ -99,16 +104,22 @@ skypoints-loyalty-pipeline/
 │   └── utils.py
 ├── sql/
 │   └── 01_ddl_tables.sql
+├── migrations/
+│   └── 20261102_01_add_batch_tracking_to_country_tables.sql
 ├── tests/
 │   └── test_pipeline.py
 ├── data/
 │   ├── USA(in).csv
 │   ├── IND(in).csv
 │   ├── AUS.xlsx
-│   └── redemptions_sample.json
+│   ├── redemptions_sample.json
+│   ├── test2_members.csv
+│   └── test_redemptions.json
 ├── requirements.txt
 └── README.md
 ```
+
+The `test2_members.csv` and `test_redemptions.json` files are additional validation fixtures. Profile files intended for automatic discovery must follow the `*_members.csv` naming convention.
 
 ## 8. Setup
 
@@ -140,17 +151,37 @@ Override the connection only if required:
 export DATABASE_URL='postgresql+psycopg2://USER:PASSWORD@localhost:5432/skypoints_db'
 ```
 
-### Apply the schema
+### Apply the database schema
 
-Apply the DDL once, if it has not already been applied:
+Apply the base DDL once, if it has not already been applied:
 
 ```bash
 psql -d skypoints_db -v ON_ERROR_STOP=1 -f sql/01_ddl_tables.sql
 ```
 
-The DDL is designed to be additive and does not drop or truncate existing tables. Back up an existing database before applying schema changes.
+Then apply the batch-tracking migration:
+
+```bash
+psql -d skypoints_db -v ON_ERROR_STOP=1 -f migrations/20261102_01_add_batch_tracking_to_country_tables.sql
+```
+
+The migration adds `last_batch_received_at` and `last_batch_id` to the five country-specific tables and creates foreign key constraints referencing `skypoints.ingestion_batches`.
+
+The DDL and migration are designed to be additive and do not drop or truncate existing tables. Back up an existing database before applying schema changes.
 
 Do not run the experimental `02_global_member_identity.sql` migration. This implementation uses the assessment-level normalized `Member Name` identity approach and does not require a global `Member ID` registry.
+
+### Configure input files
+
+Place profile CSV files matching `*_members.csv` in the `data/` directory. The pipeline discovers matching files automatically.
+
+To select a different redemption JSON file:
+
+```bash
+export REDEMPTION_FILE="data/test_redemptions.json"
+```
+
+The selected file must exist and follow the expected redemption feed structure.
 
 ### Run tests and pipeline
 
@@ -158,8 +189,6 @@ Do not run the experimental `02_global_member_identity.sql` migration. This impl
 python -m pytest -v
 python main.py
 ```
-
-Set `DATA_DIR` to change the profile input directory, or `REDEMPTION_FILE` to select another redemption JSON file.
 
 ## 9. Tests
 
@@ -182,11 +211,11 @@ The test suite uses mocked database connections for persistence-path unit tests.
 The local assessment validation observed:
 
 - 27 automated tests passed.
-- Four ingestion batches completed successfully.
-- Eight published member profiles across USA, India, and Australia.
-- Two flattened redemption transactions.
-- An invalid enrollment date was rejected and retained in the rejection audit table.
-- A duplicate normalized name (`Mike`) was found across USA and Australia. This is treated as an identity ambiguity, not proof that both records belong to the same person.
+- A multi-country profile batch contained 9 source records: 8 accepted and 1 rejected.
+- The rejected record was missing the mandatory `Member_Name` field and was retained in the rejection audit table.
+- Seven member rows were published across USA, India, Australia, Canada, and the Philippines.
+- The profile fixture contained a duplicate normalized member name (`Aisha Khan`). The latest record was selected for country-level publishing.
+- The redemption fixture had previously been processed successfully, producing flattened transaction records. An identical successful replay was subsequently skipped.
 - The supplied redemption member ID did not match the supplied profile IDs, preventing a verified member-profile join.
 - Historical records may have NULL batch lineage because they were created before batch tracking was introduced.
 

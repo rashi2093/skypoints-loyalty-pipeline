@@ -1,0 +1,48 @@
+[
+  {
+    "member_id": "900101",
+    "feed_date": "20261102",
+    "redemptions": [
+      {
+        "txn_id": "TXN9001",
+        "txn_date": "20261025",
+        "partner": "AeroLink",
+        "miles_redeemed": 12000,
+        "status": "COMPLETED"
+      },
+      {
+        "txn_id": "TXN9002",
+        "txn_date": "20261030",
+        "partner": "SkyPoints",
+        "miles_redeemed": 5000,
+        "status": "PENDING"
+      }
+    ]
+  },
+  {
+    "member_id": "900104",
+    "feed_date": "20261102",
+    "redemptions": [
+      {
+        "txn_id": "TXN9003",
+        "txn_date": "20261029",
+        "partner": "FlyWorld",
+        "miles_redeemed": 8000,
+        "status": "COMPLETED"
+      }
+    ]
+  },
+  {
+    "member_id": "900105",
+    "feed_date": "20261102",
+    "redemptions": [
+      {
+        "txn_id": "TXN9004",
+        "txn_date": "20261020",
+        "partner": "AeroLink",
+        "miles_redeemed": 7000,
+        "status": "COMPLETED"
+      }
+    ]
+  }
+]

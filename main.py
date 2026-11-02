@@ -12,11 +12,7 @@ BASE = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE / "data"))
 DB_USER = os.getenv("DB_USER", os.getenv("USER", "postgres"))
 DB_URL = os.getenv("DATABASE_URL", f"postgresql+psycopg2://{DB_USER}@localhost:5432/skypoints_db")
-COUNTRY_FILES = {
-    "USA": {"filenames": ["USA(in).csv", "USA.csv"], "type": "csv"},
-    "IND": {"filenames": ["IND(in).csv", "IND.csv"], "type": "csv"},
-    "AUS": {"filenames": ["AUS.xlsx"], "type": "excel"},
-}
+PROFILE_FILE_PATTERN = "*_members.csv"
 REDEMPTION_FILE = Path(os.getenv("REDEMPTION_FILE", DATA_DIR / "redemptions_sample.json"))
 TARGET_TABLES = {"USA":"table_usa","IND":"table_ind","AUS":"table_aus","AU":"table_aus","PHIL":"table_phil","CAN":"table_can"}
 COUNTRY_CODES = set(TARGET_TABLES)
@@ -78,15 +74,16 @@ def make_batch_key(feed_type, source_file, checksum):
 
 
 def preflight_inputs():
-    """Discover available feeds; a run may contain one or several independent batches."""
+    """Discover all member profile feeds matching *_members.csv plus the redemption feed."""
     resolved, errors = {}, []
-    for country, spec in COUNTRY_FILES.items():
-        path = next((DATA_DIR / n for n in spec["filenames"] if (DATA_DIR / n).is_file()), None)
-        if path is not None:
-            if path.stat().st_size == 0:
-                errors.append(f"Profile feed is empty: {path.name}")
-            else:
-                resolved[country] = path
+
+    for path in sorted(DATA_DIR.glob(PROFILE_FILE_PATTERN)):
+        if not path.is_file():
+            continue
+        if path.stat().st_size == 0:
+            errors.append(f"Profile feed is empty: {path.name}")
+        else:
+            resolved[path.name] = path
 
     redemption_path = REDEMPTION_FILE if REDEMPTION_FILE.is_file() else None
     if redemption_path is not None and redemption_path.stat().st_size == 0:
@@ -98,9 +95,8 @@ def preflight_inputs():
     return resolved, redemption_path
 
 
-def read_profile_file(path, file_type):
-    if file_type == "excel":
-        return pd.read_excel(path, sheet_name=0, dtype=object)
+def read_profile_file(path):
+    """Read a dynamically discovered member profile CSV file."""
     return pd.read_csv(path, dtype=object, keep_default_na=True)
 
 
@@ -177,7 +173,7 @@ def transform_source_row(row, country, filename, row_number):
 
 
 def extract_member_records(path, country):
-    frame = read_profile_file(path, COUNTRY_FILES[country]["type"])
+    frame = read_profile_file(path)
     if frame.empty:
         raise ValueError(f"Profile feed has headers but no data rows: {path.name}")
     raw, accepted, rejected, warnings = [], [], [], []
@@ -589,8 +585,10 @@ def main():
     resolved, redemption_path = preflight_inputs()
     engine = get_engine()
     try:
-        for country,path in resolved.items():
-            process_profile_file(engine,country,path)
+        for _, path in resolved.items():
+            # Country is derived from each row's Country column, so one file can
+            # contain members from multiple countries.
+            process_profile_file(engine, "MULTI", path)
         if redemption_path is not None:
             process_redemption_file(engine,redemption_path)
         logging.info("Pipeline completed")
